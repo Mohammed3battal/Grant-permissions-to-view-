@@ -1,0 +1,150 @@
+
+
+
+/***************************************************************************************
+  Recursive cross-database dependency crawler -> generate GRANT script for a nested view
+  -----------------------------------------------------------------------------------
+  Concept:
+    - Starts from the base view and walks the full dependency tree across all databases.
+    - Grants ONLY at database-boundary crossings (the base view + any object referenced
+      from a different database than its referencing object), because the ownership
+      chain covers same-database references.
+
+  How to run:
+    1) Edit the four values in the SETTINGS section below.
+    2) Run the whole script while in the context of the database holding the base view.
+    3) Copy the GrantScript column output and run it as a separate batch.
+
+  Assumption:
+    - Objects within each database share the same owner (normal case with dbo).
+      An ownership break inside a single database is NOT detected; only DB-boundary
+      crossings are treated as breaks.
+
+  Known limits:
+    - Does not capture dependencies hidden in Dynamic SQL.
+    - Does not follow Linked Server references.
+    - A Synonym shows by its own name and needs its base object resolved manually.
+***************************************************************************************/
+
+SET NOCOUNT ON;
+
+
+--Change below
+
+/* ============================== SETTINGS ============================== */
+DECLARE @StartView SYSNAME = N'dbo.YourComplexView';   -- base view (schema.view)
+DECLARE @StartDB   SYSNAME = DB_NAME();                -- base view database (current)
+DECLARE @Target    SYSNAME = N'MBLAB\NewUser';               -- target user name in databases
+DECLARE @Login     SYSNAME = N'MBLAB\NewUser';         -- mapped login
+/* ===================================================================== */
+
+
+
+
+
+
+DECLARE @db SYSNAME, @sch SYSNAME, @obj SYSNAME;
+DECLARE @d_db SYSNAME, @d_sch SYSNAME, @d_obj SYSNAME, @typ SYSNAME;
+DECLARE @inner NVARCHAR(MAX), @exec NVARCHAR(300), @typeSql NVARCHAR(MAX);
+DECLARE @objFull NVARCHAR(400), @d_full NVARCHAR(400);
+
+IF OBJECT_ID('tempdb..#queue')  IS NOT NULL DROP TABLE #queue;
+IF OBJECT_ID('tempdb..#grants') IS NOT NULL DROP TABLE #grants;
+IF OBJECT_ID('tempdb..#deps')   IS NOT NULL DROP TABLE #deps;
+
+CREATE TABLE #queue  (db_name SYSNAME, sch_name SYSNAME, obj_name SYSNAME,
+                      processed BIT DEFAULT 0,
+                      PRIMARY KEY (db_name, sch_name, obj_name));
+CREATE TABLE #grants (db_name SYSNAME, sch_name SYSNAME, obj_name SYSNAME,
+                      type_desc SYSNAME,
+                      PRIMARY KEY (db_name, sch_name, obj_name));
+CREATE TABLE #deps   (db_name SYSNAME, sch_name SYSNAME, obj_name SYSNAME);
+
+-- Seed: base view goes into both lists (entry point is always granted)
+INSERT INTO #queue  (db_name, sch_name, obj_name)
+VALUES (@StartDB, PARSENAME(@StartView,2), PARSENAME(@StartView,1));
+INSERT INTO #grants (db_name, sch_name, obj_name, type_desc)
+VALUES (@StartDB, PARSENAME(@StartView,2), PARSENAME(@StartView,1), N'VIEW');
+
+WHILE EXISTS (SELECT 1 FROM #queue WHERE processed = 0)
+BEGIN
+    SELECT TOP (1) @db = db_name, @sch = sch_name, @obj = obj_name
+    FROM #queue WHERE processed = 0;
+
+    -- Get direct dependencies of this object inside its own database
+    SET @inner = N'
+        SELECT COALESCE(d.referenced_database_name, DB_NAME()),
+               COALESCE(d.referenced_schema_name,  N''dbo''),
+               d.referenced_entity_name
+        FROM sys.sql_expression_dependencies d
+        WHERE d.referencing_id = OBJECT_ID(@o)
+          AND d.referenced_entity_name IS NOT NULL
+          AND d.referenced_class_desc = N''OBJECT_OR_COLUMN''';
+
+    SET @exec    = QUOTENAME(@db) + N'.sys.sp_executesql';
+    SET @objFull = QUOTENAME(@sch) + N'.' + QUOTENAME(@obj);
+
+    TRUNCATE TABLE #deps;
+    INSERT INTO #deps
+    EXEC @exec @inner, N'@o SYSNAME', @o = @objFull;
+
+    -- Classify each dependency
+    DECLARE cur CURSOR LOCAL FAST_FORWARD FOR
+        SELECT DISTINCT db_name, sch_name, obj_name FROM #deps;
+    OPEN cur;
+    FETCH NEXT FROM cur INTO @d_db, @d_sch, @d_obj;
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        SET @typ    = NULL;
+        SET @d_full = QUOTENAME(@d_db) + N'.' + QUOTENAME(@d_sch) + N'.' + QUOTENAME(@d_obj);
+        SET @typeSql = N'SELECT @t = type_desc FROM ' + QUOTENAME(@d_db)
+                     + N'.sys.objects WHERE object_id = OBJECT_ID(@full)';
+        EXEC sp_executesql @typeSql,
+             N'@full NVARCHAR(400), @t SYSNAME OUTPUT',
+             @full = @d_full, @t = @typ OUTPUT;
+
+        -- Database-boundary crossing only => needs a grant
+        IF @d_db <> @db AND @typ IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM #grants
+               WHERE db_name=@d_db AND sch_name=@d_sch AND obj_name=@d_obj)
+            INSERT INTO #grants (db_name, sch_name, obj_name, type_desc)
+            VALUES (@d_db, @d_sch, @d_obj, @typ);
+
+        -- Recurse into any view (local or cross-db) to find deeper crossings
+        IF @typ = N'VIEW'
+           AND NOT EXISTS (SELECT 1 FROM #queue
+               WHERE db_name=@d_db AND sch_name=@d_sch AND obj_name=@d_obj)
+            INSERT INTO #queue (db_name, sch_name, obj_name)
+            VALUES (@d_db, @d_sch, @d_obj);
+
+        FETCH NEXT FROM cur INTO @d_db, @d_sch, @d_obj;
+    END
+    CLOSE cur; DEALLOCATE cur;
+
+    UPDATE #queue SET processed = 1
+    WHERE db_name=@db AND sch_name=@sch AND obj_name=@obj;
+END
+
+/* ===================== Generate GRANT script (crossing points only) ===================== */
+
+-- (a) Create the user in each database that has a grant, if missing
+SELECT DISTINCT
+    N'USE ' + QUOTENAME(db_name) + N';' + CHAR(13)+CHAR(10)
+  + N'IF NOT EXISTS (SELECT 1 FROM sys.database_principals WHERE name = N''' + @Target + N''')'
+  + CHAR(13)+CHAR(10) + N'    CREATE USER ' + QUOTENAME(@Target)
+  + N' FOR LOGIN ' + QUOTENAME(@Login) + N';' AS GrantScript
+FROM #grants
+
+UNION ALL
+-- (b) Grant on the base view and every crossing point (correct verb)
+SELECT N'USE ' + QUOTENAME(db_name) + N'; GRANT '
+     + CASE WHEN type_desc LIKE N'%TABLE_VALUED%' THEN N'SELECT'
+            WHEN type_desc LIKE N'%SCALAR%'
+              OR type_desc = N'AGGREGATE_FUNCTION' THEN N'EXECUTE'
+            ELSE N'SELECT' END
+     + N' ON ' + QUOTENAME(sch_name) + N'.' + QUOTENAME(obj_name)
+     + N' TO ' + QUOTENAME(@Target) + N';'
+FROM #grants;
+
+DROP TABLE #queue, #grants, #deps;
+
