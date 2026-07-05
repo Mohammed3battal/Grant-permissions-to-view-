@@ -1,33 +1,26 @@
-
-
---this script to grant new user to View 
-
-USE Databasename
-
-
+USE Databasename;
 SET NOCOUNT ON;
 
-DECLARE @StartView SYSNAME = N'dbo.YourComplexView';	-- chnge view name
-DECLARE @StartDB   SYSNAME = DB_NAME();			
-DECLARE @Target    SYSNAME = N'MBLAB\NewUser';				-- change user name
-DECLARE @Login     SYSNAME = N'MBLAB\NewUser';			-- change user name
+DECLARE @StartView SYSNAME = N'dbo.YourComplexView';   -- change view name
+DECLARE @StartDB   SYSNAME = DB_NAME();
+DECLARE @Target    SYSNAME = N'MBLAB\NewUser';         -- change user name
+DECLARE @Login     SYSNAME = N'MBLAB\NewUser';         -- change login name
 
 ;WITH refs AS (
     SELECT DISTINCT
-        COALESCE(referenced_database_name, @ThisDB) AS db_name,
-        COALESCE(referenced_schema_name, N'dbo')    AS sch_name,
-        referenced_entity_name                      AS ent_name
+        COALESCE(referenced_database_name, @StartDB) AS db_name,
+        COALESCE(referenced_schema_name, N'dbo')     AS sch_name,
+        referenced_entity_name                       AS ent_name
     FROM sys.sql_expression_dependencies
-    WHERE referencing_id = OBJECT_ID(@View)
+    WHERE referencing_id = OBJECT_ID(@StartView)
       AND referenced_entity_name IS NOT NULL
       AND referenced_class_desc  = N'OBJECT_OR_COLUMN'
 )
-
 SELECT 1 AS seq, db_name,
        N'USE ' + QUOTENAME(db_name) + N';' + CHAR(13)+CHAR(10)
-     + N'IF NOT EXISTS (SELECT 1 FROM sys.database_principals WHERE name = N''' 
+     + N'IF NOT EXISTS (SELECT 1 FROM sys.database_principals WHERE name = N'''
        + @Target + N''')' + CHAR(13)+CHAR(10)
-     + N'    CREATE USER ' + QUOTENAME(@Target) 
+     + N'    CREATE USER ' + QUOTENAME(@Target)
        + N' FOR LOGIN ' + QUOTENAME(@Login) + N';' AS GrantScript
 FROM refs
 GROUP BY db_name
@@ -42,9 +35,8 @@ FROM refs
 
 UNION ALL
 
-SELECT 3 AS seq, @ThisDB,
-       N'USE ' + QUOTENAME(@ThisDB) + N'; GRANT SELECT ON ' + @View
+SELECT 3 AS seq, @StartDB,
+       N'USE ' + QUOTENAME(@StartDB) + N'; GRANT SELECT ON ' + @StartView
      + N' TO ' + QUOTENAME(@Target) + N';'
 
 ORDER BY db_name, seq;
-
